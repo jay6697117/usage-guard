@@ -1,0 +1,30 @@
+{
+  "name": "usage-guard",
+  "version": "1.0.1",
+  "description": "实时监控当前 Claude 账号的 5 小时/7 天用量，达到阈值（默认 93%）时自动拦截并停止所有任务，提示切换账号或等待额度恢复。",
+  "author": { "name": "zhangjinhui", "url": "https://github.com/jay6697117" },
+  "homepage": "https://github.com/jay6697117/usage-guard#readme",
+  "repository": "https://github.com/jay6697117/usage-guard",
+  "license": "MIT",
+  "keywords": ["usage", "quota", "rate-limit", "subscription", "guard"],
+  "userConfig": {
+    "threshold": {
+      "type": "number",
+      "title": "拦截阈值（%）",
+      "description": "任一用量窗口（5 小时、7 天等）达到这个百分比时，拦截所有提示词、模型请求、工具调用和子代理，并停止正在运行的回合。",
+      "default": 93
+    },
+    "warnAt": {
+      "type": "number",
+      "title": "预警阈值（%）",
+      "description": "达到这个百分比时状态栏变黄提示，不弹窗、不拦截。",
+      "default": 85
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "空闲轮询间隔（秒）",
+      "description": "会话空闲时多久向用量接口查询一次（运行中的回合直接读取每次响应携带的限额信息，不额外请求）。最小 30。",
+      "default": 120
+    }
+  }
+}

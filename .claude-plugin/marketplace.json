@@ -1,0 +1,12 @@
+{
+  "name": "jay6697117",
+  "description": "jay6697117 的 Claude Code 插件",
+  "owner": { "name": "zhangjinhui" },
+  "plugins": [
+    {
+      "name": "usage-guard",
+      "source": "./",
+      "description": "实时监控 Claude 账号用量（5 小时/7 天限额），达到阈值（默认 93%）时自动拦截并停止所有任务，提示切换账号或等待额度恢复"
+    }
+  ]
+}
