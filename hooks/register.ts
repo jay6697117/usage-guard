@@ -13,6 +13,12 @@
 //
 // 平时不弹任何提示：低于阈值时只在状态栏显示用量（≥ warnAt 变黄）。
 //
+// 在别的会话 /login 换账号：引擎把 OAuth token 缓存在本进程里，只在发模型请求前才重新读取凭证，
+// 而拦截期间本会话不发请求，`$.session.authorize()` 一直给出旧账号的 token，查到的也一直是旧账号的用量。
+// 所以每次查询前先对一下账号：全局配置里最近登录的账号 ≠ 本会话 token 的账号（/api/oauth/profile）时，
+// 发一个极小的 `$.model.complete`（haiku，实测约 10 个输入、几十个输出 token）让引擎重新读取凭证、换上新账号，再查新账号的用量。
+// 每次账号变化最多发一次。
+//
 // 失败策略：拿不到用量时放行（fail-open），插件出错也不会把会话锁死。
 
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
@@ -23,12 +29,15 @@ import {
   clockText,
   denyMessage,
   fromLive,
+  keyOfProfile,
+  loginOfConfig,
   merge,
   over,
   parseUsageResponse,
   report,
   statusText,
   type LiveLimit,
+  type Login,
   type Settings,
   type Window,
 } from './usage'
@@ -37,6 +46,10 @@ type Engine = EngineInterface
 
 const COMMAND = 'usage-guard'
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
+const OAUTH_HEADERS = { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' }
+/** 让引擎重新读取凭证的那次极小请求的时限。 */
+const ADOPT_TIMEOUT_MS = 15_000
 /** `$.store` 键：暂停拦截到何时（毫秒时间戳），所有会话共用。 */
 const PAUSE_KEY = 'pausedUntil'
 
@@ -69,6 +82,12 @@ type Guard = {
   lastFetchAt: number
   failures: number
   lastError: string | undefined
+  /** 已核对过、本会话 token 就是它的登录账号（全局配置里的 key）。 */
+  checkedLogin: string | undefined
+  /** 已经为它发过一次「重新读取凭证」请求的登录账号，避免同一次换号反复发请求。 */
+  adoptedFor: string | undefined
+  /** 其他会话登录了、本会话没能换过去的账号（给人看的名字）。 */
+  lag: string | undefined
 }
 
 const num = (v: unknown, fallback: number): number => {
@@ -93,6 +112,9 @@ function makeGuard(options: PluginOptions): Guard {
     lastFetchAt: 0,
     failures: 0,
     lastError: undefined,
+    checkedLogin: undefined,
+    adoptedFor: undefined,
+    lag: undefined,
   }
 }
 
@@ -121,6 +143,76 @@ function settle<T>($: Engine, p: Promise<T>, ms: number): Promise<Settled<T>> {
   })
 }
 
+// ---------------------------------------------------------------- 登录账号
+
+/** 全局配置（`$CLAUDE_CONFIG_DIR` 或家目录下的 `.claude.json`）里最近一次 /login 的账号；读不到为 undefined。 */
+async function diskLogin($: Engine): Promise<Login | undefined> {
+  try {
+    const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? (await $.env.get('HOME'))
+    if (dir === undefined || dir === '') return undefined
+    return loginOfConfig(JSON.parse(await $.fs.read(`${dir.replace(/\/+$/, '')}/.claude.json`)))
+  } catch {
+    return undefined
+  }
+}
+
+/** 这个凭证属于哪个账号；查不到为 undefined。 */
+async function tokenLogin($: Engine, handle: string): Promise<string | undefined> {
+  const res = await settle($, $.http.fetch(PROFILE_URL, { auth: handle, headers: OAUTH_HEADERS }), FETCH_TIMEOUT_MS)
+  if ('error' in res || !res.value.ok) return undefined
+  try {
+    return keyOfProfile(JSON.parse(res.value.text))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 确保本会话用的是最近一次登录的账号，返回查询用量该用的凭证 handle。
+ *
+ * 引擎只在发模型请求前重新读取凭证；被拦截的会话不发请求，别的会话 /login 换了账号后，
+ * 本会话仍拿着旧账号的 token。发现不一致时发一个极小的 `$.model.complete`：引擎发请求前会重新读取凭证、
+ * 换上新账号（结果本身不重要，出错也一样已经重读过）。同一次换号最多发一次；没换过去就记下，提示在本会话 /login。
+ */
+async function syncLogin($: Engine, g: Guard, handle: string): Promise<string> {
+  const disk = await diskLogin($)
+  if (disk === undefined || disk.key === g.checkedLogin) return handle
+  const mine = await tokenLogin($, handle)
+  if (mine === undefined) return handle // 这次查不到，下次再核对
+  if (mine === disk.key) {
+    // 本会话自己 /login 过，或从没换过号
+    g.checkedLogin = disk.key
+    g.lag = undefined
+    return handle
+  }
+  if (g.adoptedFor === disk.key) {
+    g.lag = disk.label
+    return handle
+  }
+
+  g.adoptedFor = disk.key
+  await settle(
+    $,
+    $.model.complete({ model: 'haiku', prompt: 'ok', maxTokens: 1, effort: 'low', timeoutMs: ADOPT_TIMEOUT_MS }),
+    ADOPT_TIMEOUT_MS + 2_000,
+  )
+  const next = await $.session.authorize()
+  if (next === null || next.kind !== 'bearer') return handle
+  const now = await tokenLogin($, next.handle)
+  if (now === disk.key) {
+    g.checkedLogin = disk.key
+    g.lag = undefined
+  } else {
+    g.lag = disk.label
+  }
+  if (now !== undefined && now !== mine) {
+    // 换了账号：旧账号的数据不再适用（随后的查询会整份替换；查询失败则按 fail-open 放行）
+    g.windows = []
+    g.readAt = 0
+  }
+  return next.handle
+}
+
 // ---------------------------------------------------------------- 读取用量
 
 async function fetchUsage($: Engine, g: Guard): Promise<void> {
@@ -132,14 +224,8 @@ async function fetchUsage($: Engine, g: Guard): Promise<void> {
     g.failures = 99
     return
   }
-  const res = await settle(
-    $,
-    $.http.fetch(USAGE_URL, {
-      auth: auth.handle,
-      headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
-    }),
-    FETCH_TIMEOUT_MS,
-  )
+  const handle = await syncLogin($, g, auth.handle)
+  const res = await settle($, $.http.fetch(USAGE_URL, { auth: handle, headers: OAUTH_HEADERS }), FETCH_TIMEOUT_MS)
   const now = await $.clock.now()
   const fail = (why: string): void => {
     g.failures += 1
@@ -213,8 +299,8 @@ async function evaluate($: Engine, g: Guard): Promise<boolean> {
 
 /** 刚跨过阈值：提示、系统通知，并中止正在运行的主回合。都不等待，避免卡住当前钩子。 */
 function onBlock($: Engine, g: Guard, hit: Window[], now: number): void {
-  const text = blockMessage(hit, g.settings, now)
-  $.ui.toast(blockLine(hit, g.settings, now), { timeoutMs: 30_000 })
+  const text = blockMessage(hit, g.settings, now, g.lag)
+  $.ui.toast(blockLine(hit, g.settings, now, g.lag), { timeoutMs: 30_000 })
   $.ui
     .notify(`当前账号用量已达 ${g.settings.threshold}%，所有任务已停止。请切换账号（/login）或等待额度恢复。`, {
       title: 'Claude Code · usage-guard',
@@ -230,7 +316,7 @@ function onBlock($: Engine, g: Guard, hit: Window[], now: number): void {
 /** 拦截说明：`isOneLine` 用于只显示一行的地方（丢弃提示词的理由）。 */
 async function stopText($: Engine, g: Guard, isOneLine: boolean): Promise<string> {
   const now = await $.clock.now()
-  return (isOneLine ? blockLine : blockMessage)(hitOf(g, now), g.settings, now)
+  return (isOneLine ? blockLine : blockMessage)(hitOf(g, now), g.settings, now, g.lag)
 }
 
 async function tick($: Engine, g: Guard, isFirst: boolean): Promise<void> {
@@ -264,6 +350,8 @@ async function runCommand($: Engine, g: Guard, args: string): Promise<string> {
     return '用法：/usage-guard [status]｜/usage-guard pause <分钟>｜/usage-guard resume'
   }
   if (isResume) await $.store.delete(PAUSE_KEY)
+  // 手动查询时允许再试一次切换到其他会话登录的账号
+  g.adoptedFor = undefined
   await refresh($, g, 0, FORCED_GAP_MS)
   await evaluate($, g)
   const at = await $.clock.now()
@@ -272,6 +360,7 @@ async function runCommand($: Engine, g: Guard, args: string): Promise<string> {
     readAt: g.readAt,
     error: g.lastError,
     hit: g.isBlocking ? hitOf(g, at) : [],
+    lag: g.lag,
   })
   return isResume ? `▶️ usage-guard 已恢复拦截。\n${text}` : text
 }

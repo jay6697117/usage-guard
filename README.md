@@ -12,7 +12,7 @@ Claude Code 全局插件：实时监控当前账号的订阅用量（5 小时限
 | 拦截期间提交提示词 | 直接丢弃（用户输入、/loop、定时任务、后台通知都算），并显示原因与重置时间 |
 | 拦截期间任何模型请求 | 不再发出（主线程、子代理、队友都算），以拦截说明结束回合 |
 | 拦截期间工具调用 / 启动子代理 | 全部拒绝 |
-| 切换账号（/login）后再发消息 | 重新查询用量，新账号低于阈值立即放行 |
+| 在本会话或**任意其他会话** /login 切换账号后 | 被拦截的会话再发消息（或空闲轮询时）会发现换了账号，切到新账号并重新查询用量，新账号低于阈值立即放行 |
 | 到达重置时间 | 自动放行 |
 | 阈值附近 | 拦截后要降到「阈值 − 1」以下才放行，避免两个数据源（差 1% 左右）来回切换、反复弹窗 |
 
@@ -20,13 +20,16 @@ Claude Code 全局插件：实时监控当前账号的订阅用量（5 小时限
 
 - 每次模型响应都带有账号限额信息，引擎读到后推送给插件（零额外请求，实时）；
 - 会话启动、空闲轮询（默认 120 秒）、提交提示词时数据过旧，会用**当前会话自己的凭证**查询 `https://api.anthropic.com/api/oauth/usage`，凭证由 Claude Code 代为附加，插件拿不到明文。
+- 换账号：Claude Code 把登录凭证缓存在每个会话的进程里，只在发模型请求前才重新读取；被拦截的会话不发请求，所以别的会话 `/login` 之后它仍拿着旧账号的凭证，查到的也是旧账号的用量。因此插件每次查询前会对比全局配置 `~/.claude.json` 里最近一次登录的账号（只读 `oauthAccount` 的 uuid 和邮箱）与本会话凭证所属的账号（`https://api.anthropic.com/api/oauth/profile`），不一致时发一个极小的模型请求（haiku，实测约 10 个输入、几十个输出 token），让 Claude Code 重新读取凭证、换上新账号，再查询新账号的用量。每次换号最多发一次；仍没换过去时会提示在本会话运行 `/login`，`/usage-guard` 可以再试一次。
 - 不是 Claude 订阅登录（API Key、Bedrock/Vertex 等）或查询失败时**不拦截**（fail-open），插件出错也不会锁死会话。
 
 ## 网络与数据
 
-- 插件只访问上面这一个地址（`api.anthropic.com`），不连接任何第三方服务，**没有遥测或数据上报**；插件本身不发起模型请求。
+- 插件只访问 `api.anthropic.com` 上的这两个地址（`/api/oauth/usage`、`/api/oauth/profile`），不连接任何第三方服务，**没有遥测或数据上报**。
+- 插件平时不发起模型请求；只有发现其他会话换了账号时，才发上面那一个极小的请求（计入新账号的用量，可以忽略不计）。
+- 本机只读一个文件：全局配置 `~/.claude.json`（设置了 `CLAUDE_CONFIG_DIR` 时读那个目录下的），只取 `oauthAccount` 的账号 uuid、组织 uuid 和邮箱，用来判断是否换了账号。
 - 本机只保存一项数据：`/usage-guard pause` 设定的暂停截止时间（存在插件自己的存储里，所有会话共用）。
-- `/api/oauth/usage` 不在公开文档里，以后可能变化。变化后查询会失败，插件按 fail-open 放行，模型响应里携带的限额信息照常生效。
+- `/api/oauth/usage` 和 `/api/oauth/profile` 不在公开文档里，以后可能变化。变化后查询会失败，插件按 fail-open 放行，模型响应里携带的限额信息照常生效（换账号的检测会跳过，此时在被拦截的会话里运行 `/login` 即可）。
 
 ## 命令
 
@@ -67,7 +70,7 @@ claude plugin install usage-guard@jay6697117
 git clone https://github.com/jay6697117/usage-guard
 claude --plugin-dir ./usage-guard              # 只在这一次会话里加载本地副本
 claude plugin validate --strict ./usage-guard
-claude plugin test ./usage-guard               # tests/usage-guard.test.ts，15 个用例，不联网
+claude plugin test ./usage-guard               # tests/usage-guard.test.ts，22 个用例，不联网
 ```
 
 ## 许可证

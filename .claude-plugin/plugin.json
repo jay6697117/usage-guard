@@ -1,6 +1,6 @@
 {
   "name": "usage-guard",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "实时监控当前 Claude 账号的 5 小时/7 天用量，达到阈值（默认 93%）时自动拦截并停止所有任务，提示切换账号或等待额度恢复。",
   "author": { "name": "zhangjinhui", "url": "https://github.com/jay6697117" },
   "homepage": "https://github.com/jay6697117/usage-guard#readme",

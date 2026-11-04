@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { over, parseUsageResponse } from '../hooks/usage'
+import { keyOfProfile, loginOfConfig, over, parseUsageResponse } from '../hooks/usage'
 
 const NOW = Date.parse('2026-11-04T05:00:00Z')
 const FIVE_RESET = '2026-11-04T06:20:00.019716+00:00'
@@ -23,11 +23,22 @@ const body = (five: number, seven: number): unknown => ({
 })
 
 type Figures = {
+  /** 账号 A 的用量 */
   five: number
   seven: number
+  /** 其他账号的用量 */
+  other: { five: number; seven: number }
+  /** 全局配置里最近一次 /login 的账号（任何会话登录都会改它）；undefined = 读不到 */
+  disk: string | undefined
+  /** 本会话引擎缓存着的 token 属于哪个账号 */
+  token: string
+  /** 引擎发请求前会不会重新读取凭证、换上 disk 的账号 */
+  rereads: boolean
   isUp: boolean
   isSubscription: boolean
   fetches: number
+  profiles: number
+  completes: number
   modelCalls: number
   toasts: string[]
   statuses: (string | undefined)[]
@@ -39,9 +50,15 @@ function world(on: On, five: number, seven: number) {
   const f: Figures = {
     five,
     seven,
+    other: { five: 3, seven: 5 },
+    disk: 'acct-a',
+    token: 'acct-a',
+    rereads: true,
     isUp: true,
     isSubscription: true,
     fetches: 0,
+    profiles: 0,
+    completes: 0,
     modelCalls: 0,
     toasts: [],
     statuses: [],
@@ -51,13 +68,28 @@ function world(on: On, five: number, seven: number) {
   mock.store(on)
   const session = mock.session(on)
   on('session.authorize', () => ({ value: f.isSubscription ? { handle: 'h', kind: 'bearer' as const } : null }))
-  on('http.fetch', () => {
-    f.fetches += 1
-    return {
-      value: f.isUp
-        ? { status: 200, ok: true, headers: {}, text: JSON.stringify(body(f.five, f.seven)) }
-        : { status: 503, ok: false, headers: {}, text: '' },
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
+  on('fs.read', (_, e) => {
+    if (e.path !== '/home/u/.claude.json' || f.disk === undefined) throw new Error(`ENOENT: ${e.path}`)
+    const oauthAccount = { accountUuid: f.disk, organizationUuid: 'org-1', emailAddress: `${f.disk}@example.com` }
+    return { value: JSON.stringify({ numStartups: 3, oauthAccount }) }
+  })
+  on('http.fetch', (_, e) => {
+    if (!f.isUp) return { value: { status: 503, ok: false, headers: {}, text: '' } }
+    if (e.url.endsWith('/api/oauth/profile')) {
+      f.profiles += 1
+      const profile = { account: { uuid: f.token, email: `${f.token}@example.com` }, organization: { uuid: 'org-1' } }
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(profile) } }
     }
+    f.fetches += 1
+    const u = f.token === 'acct-a' ? { five: f.five, seven: f.seven } : f.other
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body(u.five, u.seven)) } }
+  })
+  on('model.complete', () => {
+    f.completes += 1
+    if (f.rereads && f.disk !== undefined) f.token = f.disk // 引擎发请求前重新读取凭证
+    const usage = { input_tokens: 8, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { value: { isAnswered: true as const, text: 'o', usage } }
   })
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -150,6 +182,15 @@ test('重置时间已过的窗口不再计入', () => {
   const ws = parseUsageResponse(body(99, 10), NOW)
   expect(over(ws, 93, NOW).map(w => w.kind)).toEqual(['five_hour'])
   expect(over(ws, 93, Date.parse(FIVE_RESET) + 1)).toEqual([])
+})
+
+test('从全局配置和 profile 接口读出同一写法的账号', () => {
+  const cfg = { oauthAccount: { accountUuid: 'u1', organizationUuid: 'o1', emailAddress: 'a@b.c' } }
+  expect(loginOfConfig(cfg)).toEqual({ key: 'u1/o1', label: 'a@b.c' })
+  expect(keyOfProfile({ account: { uuid: 'u1' }, organization: { uuid: 'o1' } })).toBe('u1/o1')
+  expect(loginOfConfig({ oauthAccount: { accountUuid: 'u1' } })).toEqual({ key: 'u1/', label: '另一个账号' })
+  expect(loginOfConfig({})).toBeUndefined()
+  expect(keyOfProfile({ error: 'x' })).toBeUndefined()
 })
 
 // ---------------------------------------------------------------- 拦截
@@ -325,4 +366,93 @@ test('选项可以改阈值', { options: { threshold: 80 } }, async ($, on) => {
   const { clock } = world(on, 11, 85)
   await start($, clock)
   expect(dropOf(await submit($))).toContain('已达到 80% 拦截阈值')
+})
+
+// ---------------------------------------------------------------- 在其他会话换账号
+
+test('在其他会话 /login 换号后，被拦截的会话再发消息即放行', async ($, on) => {
+  const { f, clock } = world(on, 11, 95)
+  await start($, clock)
+  expect(f.completes).toBe(0) // 账号一致时不发请求
+  expect(dropOf(await submit($))).toContain('拦截阈值')
+
+  f.disk = 'acct-b' // 另一个会话 /login 到 B；本会话的引擎仍缓存着 A 的 token
+  await clock.advance(3_000)
+  expect(dropOf(await submit($))).toBeUndefined()
+  expect(f.completes).toBe(1)
+  expect(f.token).toBe('acct-b')
+  expect(f.toasts.some(t => t.includes('拦截已解除'))).toBe(true)
+  expect((await bash($)).deny).toBeUndefined()
+
+  // 换过去以后不再重复发请求
+  await clock.advance(60_000)
+  expect(dropOf(await submit($))).toBeUndefined()
+  expect(f.completes).toBe(1)
+})
+
+test('在其他会话换号后，被拦截的会话空闲时也会自动解除', async ($, on) => {
+  const { f, clock } = world(on, 11, 95)
+  await start($, clock)
+  expect(f.statuses.at(-1)).toContain('已拦截')
+
+  f.disk = 'acct-b'
+  await clock.advance(120_000) // 一次空闲轮询
+  expect(f.completes).toBe(1)
+  expect(f.toasts.some(t => t.includes('拦截已解除'))).toBe(true)
+  expect(f.statuses.at(-1)).toBe('🟢 用量 5h 3% · 7d 5%')
+})
+
+test('换到的账号同样超过阈值时继续拦截，并显示新账号的用量', async ($, on) => {
+  const { f, clock } = world(on, 11, 95)
+  f.other = { five: 97, seven: 40 }
+  await start($, clock)
+  f.disk = 'acct-b'
+  await clock.advance(3_000)
+  const drop = dropOf(await submit($))
+  expect(drop).toContain('5 小时限额 已用 97%')
+  expect(drop).not.toContain('7 天总限额 已用 95%')
+  expect(f.completes).toBe(1)
+})
+
+test('本会话自己 /login 换号时不额外发请求', async ($, on) => {
+  const { f, clock } = world(on, 11, 95)
+  await start($, clock)
+  expect(dropOf(await submit($))).toBeDefined()
+
+  f.disk = 'acct-b' // 本会话 /login：引擎的 token 同时换掉
+  f.token = 'acct-b'
+  await clock.advance(3_000)
+  expect(dropOf(await submit($))).toBeUndefined()
+  expect(f.completes).toBe(0)
+})
+
+test('没能换过去时只试一次，并提示在本会话 /login；/usage-guard 可以再试', async ($, on) => {
+  const { f, clock } = world(on, 11, 95)
+  f.rereads = false // 比如用环境变量里的 token 启动的会话
+  await start($, clock)
+  f.disk = 'acct-b'
+
+  await clock.advance(3_000)
+  const drop = dropOf(await submit($))
+  expect(drop).toContain('检测到其他会话已登录 acct-b@example.com')
+  expect(drop).not.toContain('\n')
+  expect(f.completes).toBe(1)
+
+  await clock.advance(3_000)
+  expect(dropOf(await submit($))).toContain('拦截阈值')
+  expect(f.completes).toBe(1)
+
+  await clock.advance(3_000)
+  const out = await command($, '')
+  expect(f.completes).toBe(2)
+  expect(out.text).toContain('检测到其他会话已登录 acct-b@example.com')
+})
+
+test('读不到全局配置时不核对账号，照旧工作', async ($, on) => {
+  const { f, clock } = world(on, 11, 95)
+  f.disk = undefined
+  await start($, clock)
+  expect(dropOf(await submit($))).toContain('拦截阈值')
+  expect(f.profiles).toBe(0)
+  expect(f.completes).toBe(0)
 })

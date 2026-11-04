@@ -100,6 +100,37 @@ export function parseUsageResponse(raw: unknown, at: number): Window[] {
   return [...found.values()].sort(byOrder)
 }
 
+// ---------------------------------------------------------------- 登录账号
+
+/** 一个登录账号：`key` 用来比较（账号 + 组织，同一账号换组织限额也不同），`label` 给人看。 */
+export type Login = { key: string; label: string }
+
+const loginKey = (account: unknown, org: unknown): string | undefined =>
+  typeof account === 'string' && account !== '' ? `${account}/${typeof org === 'string' ? org : ''}` : undefined
+
+/**
+ * 全局配置 `~/.claude.json` 里最近一次 /login 的账号（任何会话登录都会写这里）。
+ * 只读 `oauthAccount` 的 uuid 和邮箱，不涉及凭证。
+ */
+export function loginOfConfig(raw: unknown): Login | undefined {
+  if (!isRecord(raw) || !isRecord(raw.oauthAccount)) return undefined
+  const a = raw.oauthAccount
+  const key = loginKey(a.accountUuid, a.organizationUuid)
+  if (key === undefined) return undefined
+  const label = typeof a.emailAddress === 'string' && a.emailAddress !== '' ? a.emailAddress : '另一个账号'
+  return { key, label }
+}
+
+/** GET /api/oauth/profile 的返回 → 这个凭证属于哪个账号（与 `loginOfConfig` 的 key 同一写法）。 */
+export function keyOfProfile(raw: unknown): string | undefined {
+  if (!isRecord(raw) || !isRecord(raw.account)) return undefined
+  return loginKey(raw.account.uuid, isRecord(raw.organization) ? raw.organization.uuid : undefined)
+}
+
+/** 本会话没能换上其他会话登录的账号时的说明。 */
+export const lagText = (label: string): string =>
+  `检测到其他会话已登录 ${label}，但本会话仍在使用原账号的凭证，没能自动切换；在本会话运行 /login 即可。`
+
 /** 引擎从每次模型响应头里读到的限额 → Window。 */
 export function fromLive(limits: readonly LiveLimit[], at: number): Window[] {
   return limits
@@ -166,24 +197,26 @@ export function resetText(w: Window, now: number): string {
 const hitList = (hit: readonly Window[]): string =>
   hit.map(w => `${nameOf(w.kind)} ${pct(w.percent)}`).join('，')
 
-/** 给用户看的拦截说明。 */
-export function blockMessage(hit: readonly Window[], s: Settings, now: number): string {
+/** 给用户看的拦截说明；`lag`：其他会话登录了、本会话没能换过去的账号。 */
+export function blockMessage(hit: readonly Window[], s: Settings, now: number, lag?: string): string {
   return [
     `⛔ usage-guard：当前账号用量已达到 ${s.threshold}% 拦截阈值，已自动停止所有任务。`,
     ...hit.map(w => `   • ${nameOf(w.kind)} 已用 ${pct(w.percent)}，${resetText(w, now)}`),
+    ...(lag === undefined ? [] : [`   ⚠️ ${lagText(lag)}`]),
     '接下来可以：',
-    '   1) 切换账号：运行 /login 登录另一个账号，然后重新发送消息（新账号用量低于阈值即自动放行）',
+    '   1) 切换账号：在本会话或任意其他会话运行 /login 登录另一个账号，然后重新发送消息（新账号用量低于阈值即自动放行）',
     '   2) 等待额度恢复：到上面的重置时间后自动放行',
     '   3) 临时放行（风险自负）：/usage-guard pause 30 暂停拦截 30 分钟，/usage-guard resume 恢复',
   ].join('\n')
 }
 
 /** 单行版本：丢弃提示词的理由、弹出提示只显示一行（换行会被替换掉）。 */
-export function blockLine(hit: readonly Window[], s: Settings, now: number): string {
+export function blockLine(hit: readonly Window[], s: Settings, now: number, lag?: string): string {
   const what = hit.map(w => `${nameOf(w.kind)} 已用 ${pct(w.percent)}，${resetText(w, now)}`).join('；')
   return (
     `⛔ usage-guard：当前账号用量已达到 ${s.threshold}% 拦截阈值，已自动停止所有任务。${what}。` +
-    '可以：① 运行 /login 切换账号后重新发送；② 等到重置时间自动放行；③ /usage-guard pause 30 临时放行（风险自负）。'
+    (lag === undefined ? '' : `${lagText(lag)}`) +
+    '可以：① 在任意会话运行 /login 切换账号后重新发送；② 等到重置时间自动放行；③ /usage-guard pause 30 临时放行（风险自负）。'
   )
 }
 
@@ -219,7 +252,14 @@ export function statusText(
 }
 
 /** `hit`：正在拦截时给出拦截所依据的窗口（含解除余量内的），省略时按阈值计算。 */
-export type ReportInfo = { pausedUntil: number; readAt: number; error?: string; hit?: readonly Window[] }
+export type ReportInfo = {
+  pausedUntil: number
+  readAt: number
+  error?: string
+  hit?: readonly Window[]
+  /** 其他会话登录了、本会话没能换过去的账号 */
+  lag?: string
+}
 
 /** `/usage-guard` 的输出。 */
 export function report(ws: readonly Window[], s: Settings, now: number, info: ReportInfo): string {
@@ -239,6 +279,7 @@ export function report(ws: readonly Window[], s: Settings, now: number, info: Re
   ]
   if (info.readAt > 0) lines.push(`   数据时间：${clockText(info.readAt)}`)
   if (info.error !== undefined) lines.push(`   最近一次查询用量接口失败：${info.error}`)
-  if (hit.length > 0 && !isPaused) lines.push('', blockMessage(hit, s, now))
+  if (info.lag !== undefined) lines.push(`   ⚠️ ${lagText(info.lag)}`)
+  if (hit.length > 0 && !isPaused) lines.push('', blockMessage(hit, s, now, info.lag))
   return lines.join('\n')
 }
